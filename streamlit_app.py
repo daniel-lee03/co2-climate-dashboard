@@ -3,12 +3,12 @@
 
 import io
 import datetime
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
+import seaborn as sns  # 테마만 사용 (원하면 제거 가능)
 import streamlit as st
 
 # -----------------------------
@@ -40,6 +40,15 @@ st.title("🌍 대기 중 CO₂ 농도와 지구 평균 기온, 무슨 관계가
 st.caption("데이터 출처: NOAA GML(마우나로아 CO₂), NASA GISTEMP(지구 평균 기온 이상치)")
 
 # -----------------------------
+# 안전한 텍스트 페치 유틸
+# -----------------------------
+def fetch_text(url: str, timeout: int = 12) -> list[str]:
+    """간단한 UA/타임아웃을 가진 텍스트 로더"""
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Streamlit classroom app)"})
+    with urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8").splitlines()
+
+# -----------------------------
 # 데이터 로더
 # -----------------------------
 @st.cache_data(show_spinner=False)
@@ -50,7 +59,7 @@ def load_co2_mlo_monthly_to_annual() -> pd.DataFrame:
     출력: DataFrame[year:int, co2_ppm:float]
     """
     url = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt"
-    lines = urlopen(url).read().decode("utf-8").splitlines()
+    lines = fetch_text(url)
 
     rows = []
     for line in lines:
@@ -62,7 +71,7 @@ def load_co2_mlo_monthly_to_annual() -> pd.DataFrame:
         try:
             year = int(parts[0])
             month = int(parts[1])
-            val = float(parts[3])  # average 열 (결측 시가 있어도 연평균으로 평균 처리)
+            val = float(parts[3])  # average 열
         except Exception:
             continue
         rows.append([year, month, val])
@@ -87,7 +96,7 @@ def load_global_temp_anomaly_annual(start_year=1880, end_year=None) -> pd.DataFr
         end_year = datetime.date.today().year
 
     url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
-    txt = urlopen(url).read().decode("utf-8").splitlines()
+    txt = fetch_text(url)
 
     # 헤더 라인 탐지
     header_idx = next(i for i, line in enumerate(txt) if line.strip().startswith("Year"))
@@ -114,9 +123,14 @@ def load_global_temp_anomaly_annual(start_year=1880, end_year=None) -> pd.DataFr
 # 데이터 로드
 # -----------------------------
 with st.spinner("데이터 로딩 중... 잠시만 기다려 주세요! 🚀"):
-    co2_annual = load_co2_mlo_monthly_to_annual()
-    temp_annual = load_global_temp_anomaly_annual(1880, datetime.date.today().year)
+    try:
+        co2_annual = load_co2_mlo_monthly_to_annual()
+        temp_annual = load_global_temp_anomaly_annual(1880, datetime.date.today().year)
+    except Exception as e:
+        st.error(f"데이터를 불러오는 중 문제가 발생했습니다: {e}")
+        st.stop()
 
+# 공통 연도 계산(슬라이더 범위)
 yr_min = int(max(co2_annual["year"].min(), temp_annual["Year"].min()))
 yr_max = int(min(co2_annual["year"].max(), temp_annual["Year"].max()))
 
@@ -134,9 +148,21 @@ co2_r = co2_annual[(co2_annual["year"] >= yr_start) & (co2_annual["year"] <= yr_
 tmp_r = temp_annual[(temp_annual["Year"] >= yr_start) & (temp_annual["Year"] <= yr_end)].copy()
 df = pd.merge(co2_r.rename(columns={"year": "Year"}), tmp_r, on="Year", how="inner")
 
+# 빈 데이터 가드
+if df.empty or len(df) < 2:
+    st.warning("선택한 연도 범위에 공통 데이터가 부족합니다. 슬라이더 범위를 넓혀 보세요.")
+    st.stop()
+
+# 스무딩
 if smooth and len(df) >= 12:
     df["co2_ppm_smooth"] = df["co2_ppm"].rolling(12, center=True, min_periods=1).mean()
     df["TempAnomaly_smooth"] = df["TempAnomaly"].rolling(12, center=True, min_periods=1).mean()
+
+# 최신 연도/적용 범위 캡션
+st.caption(
+    f"적용 연도 범위: {int(df['Year'].min())}–{int(df['Year'].max())} "
+    f"(GISTEMP 최신 연도: {int(temp_annual['Year'].max())}, CO₂ 최신 연도: {int(co2_annual['year'].max())})"
+)
 
 # -----------------------------
 # 시각화
@@ -169,7 +195,7 @@ plt.title(f"CO₂ 농도와 지구 평균 기온 변화 ({yr_start}–{yr_end})"
 # 범례 통합
 lines1, labels1 = ax1.get_legend_handles_labels()
 lines2, labels2 = ax2.get_legend_handles_labels()
-legend = ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=False, prop=font_prop)
+ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=False, prop=font_prop)
 
 fig.tight_layout()
 st.pyplot(fig, clear_figure=True)
@@ -183,9 +209,21 @@ c2.metric("기온은 얼마나 변했을까?", f"{df['TempAnomaly'].iloc[-1] - d
 c3.metric("얼마나 관련 있을까? (상관계수)", f"{np.corrcoef(df['co2_ppm'], df['TempAnomaly'])[0,1]:.2f}")
 
 with st.expander("데이터 표로 확인하기"):
-    st.dataframe(df[["Year", "co2_ppm", "TempAnomaly"]].rename(columns={
-        "Year": "연도", "co2_ppm": "CO₂(ppm)", "TempAnomaly": "기온 변화(℃)"
-    }), use_container_width=True)
+    st.dataframe(
+        df[["Year", "co2_ppm", "TempAnomaly"]].rename(
+            columns={"Year": "연도", "co2_ppm": "CO₂(ppm)", "TempAnomaly": "기온 변화(℃)"}
+        ),
+        use_container_width=True
+    )
+
+# 병합 데이터 다운로드
+csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+st.download_button(
+    "📥 분석용 CSV 내려받기 (병합본)",
+    data=csv_bytes,
+    file_name=f"co2_temp_merged_{yr_start}_{yr_end}.csv",
+    mime="text/csv"
+)
 
 # -----------------------------
 # 📘 데이터 해석 (모둠 관점)
@@ -247,7 +285,6 @@ st.markdown("""
 우리 세대의 관심과 실천이 지속 가능한 미래를 만드는 첫걸음이 될 것이라고 믿습니다. 🌱
 """)
 
-
 # -----------------------------
 # 📚 참고자료
 # -----------------------------
@@ -259,10 +296,9 @@ st.markdown("""
     - [NOAA Global Monitoring Laboratory - Mauna Loa CO₂ Data](https://gml.noaa.gov/ccgg/trends/data.html)
     - [NASA GISS Surface Temperature Analysis (GISTEMP v4)](https://data.giss.nasa.gov/gistemp/)
 - **추천 도서**
-    - 그레타 툰베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023. 
+    - 그레타 퉁베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023. 
       ([Yes24 도서 정보 링크](https://www.yes24.com/product/goods/119700330))
 """)
-
 
 # -----------------------------
 # Footer (팀명)
