@@ -1,1 +1,10 @@
 streamlit
+xarray
+numpy
+pandas
+matplotlib
+cartopy
+seaborn
+pydeck
+pydap
+netCDF4
