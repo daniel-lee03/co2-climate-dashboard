@@ -3,50 +3,126 @@
 
 import io
 import datetime
-from urllib.request import Request, urlopen
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns  # 테마만 사용 (원하면 제거 가능)
+import seaborn as sns
 import streamlit as st
 
 # -----------------------------
-# ✅ 한국어 폰트 강제 등록 (절대경로)
+# ✅ 안정적 네트워크 (requests + Retry)
 # -----------------------------
-import matplotlib
+import socket
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_session = requests.Session()
+_retries = Retry(total=3, backoff_factor=0.6,
+                 status_forcelist=[429, 500, 502, 503, 504],
+                 allowed_methods=["GET"], raise_on_status=False)
+_session.mount("https://", HTTPAdapter(max_retries=_retries))
+_session.mount("http://", HTTPAdapter(max_retries=_retries))
+
+FORCE_IPV4 = True
+if FORCE_IPV4:
+    _orig_getaddrinfo = socket.getaddrinfo
+    def _ipv4_only_getaddrinfo(host, port, *args, **kwargs):
+        res = _orig_getaddrinfo(host, port, *args, **kwargs)
+        v4 = [ai for ai in res if ai[0] == socket.AF_INET]
+        return v4 or res
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+# -----------------------------
+# ✅ 한국어 폰트 등록
+# -----------------------------
 from matplotlib import font_manager as fm, rcParams
-from pathlib import Path
-
-# Pretendard-Bold.ttf 절대 경로 지정
 font_path = Path("fonts/Pretendard-Bold.ttf").resolve()
-
 if font_path.exists():
     fm.fontManager.addfont(str(font_path))
     font_prop = fm.FontProperties(fname=str(font_path))
-    rcParams["font.family"] = font_prop.get_name()  # 전역 기본 폰트명으로도 설정
-    print("✅ Loaded font:", font_prop.get_name())
+    rcParams["font.family"] = font_prop.get_name()
 else:
-    font_prop = fm.FontProperties()  # fallback
-    print("⚠️ 폰트를 찾을 수 없음:", font_path)
-
-rcParams["axes.unicode_minus"] = False  # 마이너스 기호 깨짐 방지
+    font_prop = fm.FontProperties()
+rcParams["axes.unicode_minus"] = False
 
 # -----------------------------
 # Streamlit 설정
 # -----------------------------
 st.set_page_config(layout="wide", page_title="CO₂ & Global Temperature Dashboard")
 st.title("🌍 대기 중 CO₂ 농도와 지구 평균 기온, 무슨 관계가 있을까?")
-st.caption("데이터 출처: NOAA GML(마우나로아 CO₂), NASA GISTEMP(지구 평균 기온 이상치)")
+st.caption("데이터 출처: NOAA GML, NASA GISTEMP (에러시 data 폴더 CSV로 대체)")
 
 # -----------------------------
-# 안전한 텍스트 페치 유틸
+# 안전한 fetch + fallback
 # -----------------------------
-def fetch_text(url: str, timeout: int = 12) -> list[str]:
-    """간단한 UA/타임아웃을 가진 텍스트 로더"""
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0 (Streamlit classroom app)"})
-    with urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8").splitlines()
+def safe_fetch_lines(url: str, timeout: int = 12) -> list[str]:
+    headers = {"User-Agent": "Mozilla/5.0 (Streamlit classroom app)"}
+    resp = _session.get(url, headers=headers, timeout=(6, timeout))
+    resp.raise_for_status()
+    return resp.text.replace("\r\n", "\n").splitlines()
+
+# -----------------------------
+# 데이터 로더
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def load_datasets() -> pd.DataFrame:
+    co2_url = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt"
+    temp_url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
+    fallback_path = Path("data/co2_temp_merged_1960_2024.csv")
+
+    try:
+        # 1차 시도: 원격 CO₂
+        lines = safe_fetch_lines(co2_url)
+        rows = []
+        for line in lines:
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            try:
+                year = int(parts[0])
+                val = float(parts[3])
+            except Exception:
+                continue
+            rows.append([year, val])
+        co2_df = pd.DataFrame(rows, columns=["Year", "co2_ppm"]).groupby("Year", as_index=False).mean()
+
+        # 2차 시도: 원격 GISTEMP
+        lines = safe_fetch_lines(temp_url)
+        header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Year"))
+        temp_df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+        target_col = "J-D" if "J-D" in temp_df.columns else temp_df.columns[1]
+        temp_df = temp_df[["Year", target_col]].rename(columns={target_col: "TempAnomaly"})
+        temp_df["TempAnomaly"] = pd.to_numeric(temp_df["TempAnomaly"], errors="coerce")
+        if temp_df["TempAnomaly"].abs().median() > 5:
+            temp_df["TempAnomaly"] /= 100.0
+        temp_df = temp_df.dropna()
+
+        return pd.merge(co2_df, temp_df, on="Year", how="inner")
+
+    except Exception as e:
+        if fallback_path.exists():
+            st.warning(f"⚠️ 원격 데이터 호출 실패 → 로컬 CSV 사용 ({fallback_path})")
+            return pd.read_csv(fallback_path)
+        else:
+            st.error(f"❌ 데이터 로드 실패: {e}")
+            st.stop()
+
+# -----------------------------
+# 데이터 로드
+# -----------------------------
+with st.spinner("데이터 로딩 중..."):
+    df = load_datasets()
+
+# -----------------------------
+# 이후 시각화 / 지표 / 보고서 부분은 동일
+# (df에 Year, co2_ppm, TempAnomaly 컬럼 존재 보장)
+# -----------------------------
+
 
 # -----------------------------
 # 데이터 로더
