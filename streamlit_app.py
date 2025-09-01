@@ -296,7 +296,7 @@ st.markdown("""
     - [NOAA Global Monitoring Laboratory - Mauna Loa CO₂ Data](https://gml.noaa.gov/ccgg/trends/data.html)
     - [NASA GISS Surface Temperature Analysis (GISTEMP v4)](https://data.giss.nasa.gov/gistemp/)
 - **추천 도서**
-    - 그레타 퉁베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023. 
+    - 그레타 툰베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023. 
       ([Yes24 도서 정보 링크](https://www.yes24.com/product/goods/119700330))
 """)
 
