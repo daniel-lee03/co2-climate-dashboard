@@ -20,12 +20,17 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 _session = requests.Session()
-_retries = Retry(total=3, backoff_factor=0.6,
-                 status_forcelist=[429, 500, 502, 503, 504],
-                 allowed_methods=["GET"], raise_on_status=False)
+_retries = Retry(
+    total=3,
+    backoff_factor=0.6,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["GET"],
+    raise_on_status=False,
+)
 _session.mount("https://", HTTPAdapter(max_retries=_retries))
 _session.mount("http://", HTTPAdapter(max_retries=_retries))
 
+# 배포 환경에서 IPv6 문제 회피용 (필요 없으면 False)
 FORCE_IPV4 = True
 if FORCE_IPV4:
     _orig_getaddrinfo = socket.getaddrinfo
@@ -53,89 +58,42 @@ rcParams["axes.unicode_minus"] = False
 # -----------------------------
 st.set_page_config(layout="wide", page_title="CO₂ & Global Temperature Dashboard")
 st.title("🌍 대기 중 CO₂ 농도와 지구 평균 기온, 무슨 관계가 있을까?")
-st.caption("데이터 출처: NOAA GML, NASA GISTEMP (에러시 data 폴더 CSV로 대체)")
+st.caption("데이터 출처: NOAA GML, NASA GISTEMP · 실패 시 data/co2_temp_merged_1960_2024.csv 사용")
 
 # -----------------------------
-# 안전한 fetch + fallback
+# 안전한 fetch 유틸 (requests 기반)
 # -----------------------------
-def safe_fetch_lines(url: str, timeout: int = 12) -> list[str]:
+def fetch_text(url: str, timeout: int = 12) -> list[str]:
+    """urllib 대체. 세션/재시도/백오프/IPv4 우선."""
     headers = {"User-Agent": "Mozilla/5.0 (Streamlit classroom app)"}
     resp = _session.get(url, headers=headers, timeout=(6, timeout))
     resp.raise_for_status()
     return resp.text.replace("\r\n", "\n").splitlines()
 
+def safe_fetch_lines(url: str, *, fallback_path: Path | None = None, timeout: int = 12) -> list[str] | None:
+    """성공 시 텍스트 라인 반환, 실패 시 fallback_path가 존재하면 None(=로컬 사용 신호) 반환."""
+    try:
+        return fetch_text(url, timeout=timeout)
+    except Exception:
+        if fallback_path and fallback_path.exists():
+            st.warning(f"⚠️ 원격 데이터 호출 실패 → 로컬 CSV 사용 ({fallback_path})")
+            return None
+        raise
+
 # -----------------------------
-# 데이터 로더
+# 데이터 로더 (원격 → 실패 시 data CSV)
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def load_datasets() -> pd.DataFrame:
     co2_url = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt"
     temp_url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
-    fallback_path = Path("data/co2_temp_merged_1960_2024.csv")
+    fallback = Path("data/co2_temp_merged_1960_2024.csv")
 
-    try:
-        # 1차 시도: 원격 CO₂
-        lines = safe_fetch_lines(co2_url)
-        rows = []
-        for line in lines:
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 4:
-                continue
-            try:
-                year = int(parts[0])
-                val = float(parts[3])
-            except Exception:
-                continue
-            rows.append([year, val])
-        co2_df = pd.DataFrame(rows, columns=["Year", "co2_ppm"]).groupby("Year", as_index=False).mean()
-
-        # 2차 시도: 원격 GISTEMP
-        lines = safe_fetch_lines(temp_url)
-        header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Year"))
-        temp_df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
-        target_col = "J-D" if "J-D" in temp_df.columns else temp_df.columns[1]
-        temp_df = temp_df[["Year", target_col]].rename(columns={target_col: "TempAnomaly"})
-        temp_df["TempAnomaly"] = pd.to_numeric(temp_df["TempAnomaly"], errors="coerce")
-        if temp_df["TempAnomaly"].abs().median() > 5:
-            temp_df["TempAnomaly"] /= 100.0
-        temp_df = temp_df.dropna()
-
-        return pd.merge(co2_df, temp_df, on="Year", how="inner")
-
-    except Exception as e:
-        if fallback_path.exists():
-            st.warning(f"⚠️ 원격 데이터 호출 실패 → 로컬 CSV 사용 ({fallback_path})")
-            return pd.read_csv(fallback_path)
-        else:
-            st.error(f"❌ 데이터 로드 실패: {e}")
-            st.stop()
-
-# -----------------------------
-# 데이터 로드
-# -----------------------------
-with st.spinner("데이터 로딩 중..."):
-    df = load_datasets()
-
-# -----------------------------
-# 이후 시각화 / 지표 / 보고서 부분은 동일
-# (df에 Year, co2_ppm, TempAnomaly 컬럼 존재 보장)
-# -----------------------------
-
-
-# -----------------------------
-# 데이터 로더
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_co2_mlo_monthly_to_annual() -> pd.DataFrame:
-    """
-    NOAA GML Mauna Loa 월별 CO₂ 텍스트를 로드하여 연평균으로 변환
-    URL: https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt
-    출력: DataFrame[year:int, co2_ppm:float]
-    """
-    url = "https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_mm_mlo.txt"
-    lines = fetch_text(url)
+    # 1) CO₂
+    lines = safe_fetch_lines(co2_url, fallback_path=fallback)
+    if lines is None:
+        # 완성 병합본 CSV로 대체
+        return pd.read_csv(fallback)
 
     rows = []
     for line in lines:
@@ -147,126 +105,99 @@ def load_co2_mlo_monthly_to_annual() -> pd.DataFrame:
         try:
             year = int(parts[0])
             month = int(parts[1])
-            val = float(parts[3])  # average 열
+            val = float(parts[3])  # average column
         except Exception:
             continue
         rows.append([year, month, val])
+    co2_df = pd.DataFrame(rows, columns=["year", "month", "co2_ppm"])
+    co2_df = co2_df.groupby("year", as_index=False)["co2_ppm"].mean().rename(columns={"year": "Year"})
 
-    dfm = pd.DataFrame(rows, columns=["year", "month", "co2_ppm"])
-    dfa = dfm.groupby("year", as_index=False)["co2_ppm"].mean()
-    dfa = dfa.dropna().sort_values("year").reset_index(drop=True)
-    return dfa
+    # 2) GISTEMP
+    lines = safe_fetch_lines(temp_url, fallback_path=fallback)
+    if lines is None:
+        return pd.read_csv(fallback)
 
+    header_idx = next(i for i, line in enumerate(lines) if line.strip().startswith("Year"))
+    temp_df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])))
+    target_col = "J-D" if "J-D" in temp_df.columns else temp_df.columns[1]
+    temp_df = temp_df[["Year", target_col]].rename(columns={target_col: "TempAnomaly"})
+    temp_df["TempAnomaly"] = pd.to_numeric(temp_df["TempAnomaly"], errors="coerce")
+    # 센티-섭씨 스케일이면 ℃로 변경
+    if temp_df["TempAnomaly"].abs().median() > 5:
+        temp_df["TempAnomaly"] = temp_df["TempAnomaly"] / 100.0
+    temp_df = temp_df.dropna()
 
-@st.cache_data(show_spinner=False)
-def load_global_temp_anomaly_annual(start_year=1880, end_year=None) -> pd.DataFrame:
-    """
-    NASA GISTEMP Global Land+Ocean 연평균 기온 이상치 로드
-    URL: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
-    - 헤더(Year) 라인 탐지 후 CSV 파싱
-    - 'J-D'(연평균) 사용
-    - 문자열→숫자 변환, 센티-섭씨(×100) 여부 자동 판별
-    출력: DataFrame[Year:int, TempAnomaly:float(℃)]
-    """
-    if end_year is None:
-        end_year = datetime.date.today().year
-
-    url = "https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"
-    txt = fetch_text(url)
-
-    # 헤더 라인 탐지
-    header_idx = next(i for i, line in enumerate(txt) if line.strip().startswith("Year"))
-    df = pd.read_csv(io.StringIO("\n".join(txt[header_idx:])))
-
-    target_col = "J-D" if "J-D" in df.columns else df.columns[1]
-    out = df[["Year", target_col]].rename(columns={target_col: "TempAnomaly"}).dropna()
-
-    # 문자열 → 숫자
-    out["TempAnomaly"] = pd.to_numeric(out["TempAnomaly"], errors="coerce")
-    out = out.dropna()
-
-    # 스케일 자동 판별(센티℃ → ℃)
-    if out["TempAnomaly"].abs().median() > 5:
-        out["TempAnomaly"] = out["TempAnomaly"] / 100.0
-
-    # 연도 범위 필터
-    out = out[(out["Year"] >= start_year) & (out["Year"] <= end_year)].copy()
-    out["Year"] = out["Year"].astype(int)
-    out = out.sort_values("Year").reset_index(drop=True)
-    return out
+    merged = pd.merge(co2_df, temp_df, on="Year", how="inner").sort_values("Year").reset_index(drop=True)
+    return merged
 
 # -----------------------------
 # 데이터 로드
 # -----------------------------
 with st.spinner("데이터 로딩 중... 잠시만 기다려 주세요! 🚀"):
     try:
-        co2_annual = load_co2_mlo_monthly_to_annual()
-        temp_annual = load_global_temp_anomaly_annual(1880, datetime.date.today().year)
+        df = load_datasets()
     except Exception as e:
         st.error(f"데이터를 불러오는 중 문제가 발생했습니다: {e}")
         st.stop()
 
-# 공통 연도 계산(슬라이더 범위)
-yr_min = int(max(co2_annual["year"].min(), temp_annual["Year"].min()))
-yr_max = int(min(co2_annual["year"].max(), temp_annual["Year"].max()))
+# df 컬럼 가드
+required_cols = {"Year", "co2_ppm", "TempAnomaly"}
+if not required_cols.issubset(df.columns):
+    st.error(f"필수 컬럼 누락: {required_cols - set(df.columns)}")
+    st.stop()
+
+# -----------------------------
+# UI: 기간 선택
+# -----------------------------
+yr_min = int(df["Year"].min())
+yr_max = int(df["Year"].max())
 
 st.sidebar.header("연도 범위 선택")
 yr_start, yr_end = st.sidebar.slider(
-    "보고 싶은 기간을 골라보세요!", min_value=yr_min, max_value=yr_max,
+    "보고 싶은 기간을 골라보세요!",
+    min_value=yr_min, max_value=yr_max,
     value=(max(1960, yr_min), yr_max), step=1
 )
 smooth = st.sidebar.checkbox("12년 이동평균 (전체적인 흐름 보기)", value=True)
 
-# -----------------------------
-# 데이터 결합
-# -----------------------------
-co2_r = co2_annual[(co2_annual["year"] >= yr_start) & (co2_annual["year"] <= yr_end)].copy()
-tmp_r = temp_annual[(temp_annual["Year"] >= yr_start) & (temp_annual["Year"] <= yr_end)].copy()
-df = pd.merge(co2_r.rename(columns={"year": "Year"}), tmp_r, on="Year", how="inner")
-
-# 빈 데이터 가드
-if df.empty or len(df) < 2:
-    st.warning("선택한 연도 범위에 공통 데이터가 부족합니다. 슬라이더 범위를 넓혀 보세요.")
+df_r = df[(df["Year"] >= yr_start) & (df["Year"] <= yr_end)].copy()
+if df_r.empty or len(df_r) < 2:
+    st.warning("선택한 연도 범위에 데이터가 부족합니다. 범위를 넓혀 보세요.")
     st.stop()
 
-# 스무딩
-if smooth and len(df) >= 12:
-    df["co2_ppm_smooth"] = df["co2_ppm"].rolling(12, center=True, min_periods=1).mean()
-    df["TempAnomaly_smooth"] = df["TempAnomaly"].rolling(12, center=True, min_periods=1).mean()
+if smooth and len(df_r) >= 12:
+    df_r["co2_ppm_smooth"] = df_r["co2_ppm"].rolling(12, center=True, min_periods=1).mean()
+    df_r["TempAnomaly_smooth"] = df_r["TempAnomaly"].rolling(12, center=True, min_periods=1).mean()
 
-# 최신 연도/적용 범위 캡션
 st.caption(
-    f"적용 연도 범위: {int(df['Year'].min())}–{int(df['Year'].max())} "
-    f"(GISTEMP 최신 연도: {int(temp_annual['Year'].max())}, CO₂ 최신 연도: {int(co2_annual['year'].max())})"
+    f"적용 연도 범위: {int(df_r['Year'].min())}–{int(df_r['Year'].max())} "
+    f"(전체 데이터 최신 연도: {int(df['Year'].max())})"
 )
 
 # -----------------------------
 # 시각화
 # -----------------------------
 st.subheader("📈 CO₂ 농도와 지구 평균 기온, 같이 볼까요?")
-
 sns.set_theme(style="whitegrid")
 fig, ax1 = plt.subplots(figsize=(10.5, 5.2))
 
 # CO₂ (좌축)
-ax1.plot(df["Year"], df["co2_ppm"], lw=1.6, color="#1f77b4", alpha=0.45, label="CO₂ 농도 (연평균)")
-if smooth and "co2_ppm_smooth" in df.columns:
-    ax1.plot(df["Year"], df["co2_ppm_smooth"], lw=2.8, color="#1f77b4", label="CO₂ 농도 (장기 추세)")
+ax1.plot(df_r["Year"], df_r["co2_ppm"], lw=1.6, color="#1f77b4", alpha=0.45, label="CO₂ 농도 (연평균)")
+if smooth and "co2_ppm_smooth" in df_r.columns:
+    ax1.plot(df_r["Year"], df_r["co2_ppm_smooth"], lw=2.8, color="#1f77b4", label="CO₂ 농도 (장기 추세)")
 ax1.set_xlabel("연도", fontproperties=font_prop)
 ax1.set_ylabel("대기 중 CO₂ (ppm)", color="#1f77b4", fontproperties=font_prop)
 ax1.tick_params(axis="y", labelcolor="#1f77b4")
 
 # 기온 이상치 (우축)
 ax2 = ax1.twinx()
-ax2.plot(df["Year"], df["TempAnomaly"], lw=1.6, color="#d62728", alpha=0.45, label="기온 변화 (연평균)")
-if smooth and "TempAnomaly_smooth" in df.columns:
-    ax2.plot(df["Year"], df["TempAnomaly_smooth"], lw=2.8, color="#d62728", label="기온 변화 (장기 추세)")
+ax2.plot(df_r["Year"], df_r["TempAnomaly"], lw=1.6, color="#d62728", alpha=0.45, label="기온 변화 (연평균)")
+if smooth and "TempAnomaly_smooth" in df_r.columns:
+    ax2.plot(df_r["Year"], df_r["TempAnomaly_smooth"], lw=2.8, color="#d62728", label="기온 변화 (장기 추세)")
 ax2.set_ylabel("지구 평균 기온 변화 (℃)", color="#d62728", fontproperties=font_prop)
 ax2.tick_params(axis="y", labelcolor="#d62728")
 
-# 제목(한글 폰트 강제)
-plt.title(f"CO₂ 농도와 지구 평균 기온 변화 ({yr_start}–{yr_end})",
-          pad=10, fontproperties=font_prop)
+plt.title(f"CO₂ 농도와 지구 평균 기온 변화 ({yr_start}–{yr_end})", pad=10, fontproperties=font_prop)
 
 # 범례 통합
 lines1, labels1 = ax1.get_legend_handles_labels()
@@ -280,22 +211,21 @@ st.pyplot(fig, clear_figure=True)
 # 요약 지표
 # -----------------------------
 c1, c2, c3 = st.columns(3)
-c1.metric("CO₂ 얼마나 늘었을까?", f"{df['co2_ppm'].iloc[-1] - df['co2_ppm'].iloc[0]:+.1f} ppm")
-c2.metric("기온은 얼마나 변했을까?", f"{df['TempAnomaly'].iloc[-1] - df['TempAnomaly'].iloc[0]:+.2f} ℃")
-c3.metric("얼마나 관련 있을까? (상관계수)", f"{np.corrcoef(df['co2_ppm'], df['TempAnomaly'])[0,1]:.2f}")
+c1.metric("CO₂ 얼마나 늘었을까?", f"{df_r['co2_ppm'].iloc[-1] - df_r['co2_ppm'].iloc[0]:+.1f} ppm")
+c2.metric("기온은 얼마나 변했을까?", f"{df_r['TempAnomaly'].iloc[-1] - df_r['TempAnomaly'].iloc[0]:+.2f} ℃")
+c3.metric("얼마나 관련 있을까? (상관계수)", f"{np.corrcoef(df_r['co2_ppm'], df_r['TempAnomaly'])[0,1]:.2f}")
 
 with st.expander("데이터 표로 확인하기"):
     st.dataframe(
-        df[["Year", "co2_ppm", "TempAnomaly"]].rename(
-            columns={"Year": "연도", "co2_ppm": "CO₂(ppm)", "TempAnomaly": "기온 변화(℃)"}
-        ),
+        df_r[["Year", "co2_ppm", "TempAnomaly"]]
+          .rename(columns={"Year": "연도", "co2_ppm": "CO₂(ppm)", "TempAnomaly": "기온 변화(℃)"}),
         use_container_width=True
     )
 
-# 병합 데이터 다운로드
-csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+# 병합 데이터 다운로드 (현재 구간)
+csv_bytes = df_r.to_csv(index=False).encode("utf-8-sig")
 st.download_button(
-    "📥 분석용 CSV 내려받기 (병합본)",
+    "📥 분석용 CSV 내려받기 (현재 구간 병합본)",
     data=csv_bytes,
     file_name=f"co2_temp_merged_{yr_start}_{yr_end}.csv",
     mime="text/csv"
